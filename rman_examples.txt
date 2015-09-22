@@ -1,0 +1,33 @@
+
+set decryption identified by 'N/A' ;
+run {
+allocate channel ch0 type 'SBT_TAPE' PARMS 'SBT_LIBRARY=/apollo/env/GPSDBAS3Libraries/lib/libosbws12.so ENV=(_OSB_WS_ALLOCBUF_DISABLE=1,OSB_WS_PFILE=/apollo/env/GPSDBAS3Libraries/etc/s3-backup-config-devo2)';
+allocate channel ch1 type 'SBT_TAPE' PARMS 'SBT_LIBRARY=/apollo/env/GPSDBAS3Libraries/lib/libosbws12.so ENV=(_OSB_WS_ALLOCBUF_DISABLE=1,OSB_WS_PFILE=/apollo/env/GPSDBAS3Libraries/etc/s3-backup-config-devo2)';
+allocate channel ch2 type 'SBT_TAPE' PARMS 'SBT_LIBRARY=/apollo/env/GPSDBAS3Libraries/lib/libosbws12.so ENV=(_OSB_WS_ALLOCBUF_DISABLE=1,OSB_WS_PFILE=/apollo/env/GPSDBAS3Libraries/etc/s3-backup-config-devo2)';
+allocate channel ch3 type 'SBT_TAPE' PARMS 'SBT_LIBRARY=/apollo/env/GPSDBAS3Libraries/lib/libosbws12.so ENV=(_OSB_WS_ALLOCBUF_DISABLE=1,OSB_WS_PFILE=/apollo/env/GPSDBAS3Libraries/etc/s3-backup-config-devo2)';
+allocate channel ch4 type 'SBT_TAPE' PARMS 'SBT_LIBRARY=/apollo/env/GPSDBAS3Libraries/lib/libosbws12.so ENV=(_OSB_WS_ALLOCBUF_DISABLE=1,OSB_WS_PFILE=/apollo/env/GPSDBAS3Libraries/etc/s3-backup-config-devo2)';
+Recover Database;
+Restore Database;
+release channel ch0;
+release channel ch1;
+release channel ch2;
+release channel ch3;
+release channel ch4;
+}
+
+
+set decryption identified by 'N/A' ;
+run {
+allocate channel ch0 type 'SBT_TAPE' PARMS 'SBT_LIBRARY=/apollo/env/GPSDBAS3Libraries/lib/libosbws12.so ENV=(_OSB_WS_ALLOCBUF_DISABLE=1,OSB_WS_PFILE=/apollo/env/GPSDBAS3Libraries/etc/s3-backup-config-devo2)';
+allocate channel ch1 type 'SBT_TAPE' PARMS 'SBT_LIBRARY=/apollo/env/GPSDBAS3Libraries/lib/libosbws12.so ENV=(_OSB_WS_ALLOCBUF_DISABLE=1,OSB_WS_PFILE=/apollo/env/GPSDBAS3Libraries/etc/s3-backup-config-devo2)';
+allocate channel ch2 type 'SBT_TAPE' PARMS 'SBT_LIBRARY=/apollo/env/GPSDBAS3Libraries/lib/libosbws12.so ENV=(_OSB_WS_ALLOCBUF_DISABLE=1,OSB_WS_PFILE=/apollo/env/GPSDBAS3Libraries/etc/s3-backup-config-devo2)';
+allocate channel ch3 type 'SBT_TAPE' PARMS 'SBT_LIBRARY=/apollo/env/GPSDBAS3Libraries/lib/libosbws12.so ENV=(_OSB_WS_ALLOCBUF_DISABLE=1,OSB_WS_PFILE=/apollo/env/GPSDBAS3Libraries/etc/s3-backup-config-devo2)';
+allocate channel ch4 type 'SBT_TAPE' PARMS 'SBT_LIBRARY=/apollo/env/GPSDBAS3Libraries/lib/libosbws12.so ENV=(_OSB_WS_ALLOCBUF_DISABLE=1,OSB_WS_PFILE=/apollo/env/GPSDBAS3Libraries/etc/s3-backup-config-devo2)';
+SET ARCHIVELOG DESTINATION TO '/arch-01';
+RESTORE ARCIVELOG FROM SEQUENCE  1 UNTIL SEQUENCE 26;
+release channel ch0;
+release channel ch1;
+release channel ch2;
+release channel ch3;
+release channel ch4;
+}
