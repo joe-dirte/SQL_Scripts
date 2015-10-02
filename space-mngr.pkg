@@ -1,0 +1,945 @@
+
+create or replace package admin.space_mngr
+as
+
+    -- ************************************************************************************************
+    --
+    -- Version 1.0
+    --
+    -- The following tables and views are required (they are not defined here):
+    --
+    -- table    admin.space_mngr_filesystem_info
+    -- table    admin.space_mngr_decision_log
+    -- table    admin.space_mngr_configuration
+    -- view     admin.space_mngr_tablespace_info
+    -- view     admin.space_mngr_filesystem_usage
+    --
+    -- The following directives are recognized in admin.space_mngr_configuration:
+    --
+    --                                            ------- APPLIES TO -----------
+    -- PARAMETER                       DEFAULT    GLOBAL  TABLESPACE  FILESYSTEM
+    -- ------------------------------  ---------  ------  ----------  ----------
+    -- p_fs_pct_full_ignore            95         YES     NO          YES
+    -- p_import_fs_info                false      YES     NO          NO
+    -- p_max_gigs_per_db_per_day       64         YES     NO          NO
+    -- p_max_gigs_per_tbl_per_day      64         YES     YES         NO
+    -- p_min_days_left                 10         YES     YES         NO
+    -- p_min_extents                   100        YES     YES         NO
+    -- p_min_space                     500        YES     YES         NO
+    -- p_tablespace_max_size           null       YES     YES         NO
+    -- p_tablespaces                   null       YES     NO          NO
+    -- p_file_size_m                   null       NO      YES         NO
+    -- p_prefer_resize                 false      YES     YES         NO
+    -- -- TEST PARAMETERS
+    -- p_test_db_files                 null       YES     NO          NO
+    --
+    -- Most parameters are global. Many parameters also apply to either a specific tablespace or a
+    -- specific filesystem, but not both. In other words, we can state that we prefer resize operations
+    -- over adding files at either the global or tablespace level, but not at the filesystem level.
+    -- Specific trumps general.
+    --
+    -- ************************************************************************************************
+
+    procedure run_space_mngr( p_min_extents              in integer  default null,
+                              p_min_space                in integer  default null,
+                              p_min_days_left            in integer  default null,
+                              p_fs_pct_full_ignore       in integer  default null,
+                              p_max_gigs_per_tbl_per_day in integer  default null,
+                              p_max_gigs_per_db_per_day  in integer  default null,
+                              p_tablespaces              in varchar2 default null,
+                              p_donothing                in boolean  default false,
+                              p_debug                    in boolean  default false,
+                              p_import_fs_info           in boolean  default false
+                              );
+
+    procedure enable_tool;
+    procedure disable_tool;
+
+    procedure import_filesystem_information;
+
+    procedure set_parameter( p_parameter_name   varchar2,
+                             p_parameter_value  varchar2,
+                             p_tablespace_name  varchar2 default null,
+                             p_fs_prefix        varchar2 default null );
+    procedure drop_parameter( p_parameter_name  varchar2,
+                              p_tablespace_name varchar2 default null,
+                              p_fs_prefix       varchar2 default null );
+
+end;
+/
+
+
+create or replace package body admin.space_mngr is
+
+    -- ************************************************************************************************
+    -- EXCEPTIONS
+    -- ************************************************************************************************
+
+    excp_en_assertion     constant number   := -20501;
+    excp_assertion        exception;
+    pragma exception_init( excp_assertion,     -20501 );
+
+    excp_en_no_filesystem constant number   := -20502;
+    excp_no_filesystem    exception;
+    pragma exception_init( excp_no_filesystem, -20502 );
+
+    excp_en_bad_filename  constant number   := -20503;
+    excp_bad_filename     exception;
+    pragma exception_init( excp_bad_filename,  -20503 );
+
+    excp_en_bad_parameter constant number   := -20504;
+    excp_bad_parameter    exception;
+    pragma exception_init( excp_bad_parameter, -20504 );
+
+    -- ************************************************************************************************
+    -- TYPES
+    -- ************************************************************************************************
+
+    -- Maintains a static record of tablespace information. The view can be quite slow.
+    type tablespace_info_list_t is table of admin.space_mngr_tablespace_info%rowtype index by varchar2(30);
+
+    -- ************************************************************************************************
+    -- GLOBAL VARIABLES and SETTINGS
+    -- ************************************************************************************************
+
+    g_debug            boolean      := false;
+    g_do_nothing       boolean      := false;
+    g_execution_id     integer      := 0;
+    g_db_name          varchar2(30);
+    g_decision_id_seq  number       := 1;
+
+    g_tablespace_info  tablespace_info_list_t;
+
+    g_min_extents              integer;
+    g_min_space                integer;
+    g_min_days_left            integer;
+    g_fs_pct_full_ignore       integer;
+    g_max_gigs_per_tbl_per_day integer;
+    g_max_gigs_per_db_per_day  integer;
+
+    -- ************************************************************************************************
+    -- FORWARD PROCEDURE DECLARATIONS.
+    -- ************************************************************************************************
+
+    procedure retrieve_configuration_value( p_cfg_name        in     varchar2,
+                                            p_cfg_value       in out integer,
+                                            p_cfg_default     in     integer,
+                                            p_fs_prefix       in     varchar2 default null,
+                                            p_tablespace_name in     varchar2 default null);
+    procedure retrieve_configuration_value( p_cfg_name        in     varchar2,
+                                            p_cfg_value       in out boolean,
+                                            p_cfg_default     in     boolean,
+                                            p_fs_prefix       in     varchar2 default null,
+                                            p_tablespace_name in     varchar2 default null);
+    procedure retrieve_configuration_value( p_cfg_name        in     varchar2,
+                                            p_cfg_value       in out varchar2,
+                                            p_cfg_default     in     varchar2,
+                                            p_fs_prefix       in     varchar2 default null,
+                                            p_tablespace_name in     varchar2 default null);
+
+    procedure log_decision( p_decision_name    in varchar2,
+                            p_decision_details in varchar2 );
+
+    -- ************************************************************************************************
+    -- SEQUENCES
+    -- ************************************************************************************************
+
+    function get_execution_id
+        return number
+    is
+        v_execution_id number;
+    begin
+        v_execution_id := (to_number(sys_context('userenv','sessionid'))*1000000000000000000)
+                        + to_number(to_char(systimestamp,'hh24missff'));
+        return v_execution_id;
+    end;
+
+    function get_decision_id
+        return number
+    is
+        v_decision_id number;
+    begin
+        v_decision_id     := g_decision_id_seq;
+        g_decision_id_seq := g_decision_id_seq + 1;
+        return v_decision_id;
+    end;
+
+    function get_next_file_id( p_tablespace varchar2 )
+        return integer
+    is
+        v_file_id     integer;
+        v_file_regexp varchar2(80);
+    begin
+        v_file_regexp := '^.*[a-zA-Z_-](\d+)\.dbf$';
+        select max(to_number(case when regexp_like(file_name,v_file_regexp)
+                    then regexp_replace(file_name,v_file_regexp,'\1')
+                    else '100' -- Seems like a suitable default value.
+                end)) into v_file_id
+          from dba_data_files
+         where tablespace_name = p_tablespace;
+        return v_file_id + 1;
+    end;
+
+    -- ************************************************************************************************
+    -- PREDICATES
+    -- ************************************************************************************************
+
+    function is_fs_info_recent( p_max_hours number := 1 )
+       return boolean
+    is
+        v_recent_count integer;
+    begin
+        -- We must have filesystem information less than one hour old.
+        select count(*) into v_recent_count
+          from admin.space_mngr_filesystem_info
+         where collection_date > sysdate - (p_max_hours/24);
+        return (v_recent_count > 0);
+    end;
+
+    function is_open_primary
+       return boolean
+    is
+       v_database_role varchar2(30);
+       v_open_mode     varchar2(30);
+    begin
+        select database_role,open_mode  into v_database_role, v_open_mode from v$database;
+        if (v_database_role !='PRIMARY') OR (v_open_mode !='READ WRITE') then
+           return false;
+        else
+           return true;
+        end if;
+    end;
+
+    function is_sole_execution
+        return boolean
+    is
+        v_space_mngrs_running integer;
+    begin
+        -- This assumes we have set the module prior to invoking this function.
+        select count(*) into v_space_mngrs_running from v$session where module = 'AutoSpaceManager';
+        return v_space_mngrs_running < 2;
+    end;
+
+    function is_tool_disabled
+       return boolean
+    is
+        v_disable_space_mngr number;
+    begin
+        select count(*) into v_disable_space_mngr
+          from admin.space_mngr_configuration
+         where parameter_name  = 'disabled'
+           and parameter_value = 'TRUE'
+           and tablespace_name is null
+           and filesystem_prefix is null;
+        return v_disable_space_mngr > 0;
+    end;
+
+    function is_tablespace_filename_used( p_tablespace varchar2, p_filename varchar2 )
+        return boolean
+        -- Confirm the specified file isn't in use by the target tablespace.
+        -- This is an extra validation check, primarily to ensure we do not use
+        -- the same number on multiple filesystems.
+    is
+        v_file_count number;
+    begin
+        select count(*) into v_file_count
+          from dba_data_files
+         where tablespace_name = upper(p_tablespace)
+           and file_name like '%'||p_filename;
+        log_decision( 'is_filename_used', 'Count for ' || p_tablespace || '/' || p_filename || ' is ' || v_file_count );
+        return v_file_count > 0;
+    end;
+
+    -- ************************************************************************************************
+    -- LOGGING
+    -- ************************************************************************************************
+
+    procedure print_line( p_text_to_print in varchar2, p_force boolean default false ) is
+    begin
+        if p_force or g_debug or g_do_nothing then
+            dbms_output.put_line( p_text_to_print );
+        end if;
+    end;
+
+    procedure log_decision( p_decision_name    in varchar2,
+                            p_decision_details in varchar2 ) is
+        pragma autonomous_transaction;
+        v_decision_id number;
+    begin
+        print_line( p_decision_details );
+        if is_open_primary() then
+            if not g_debug then
+                v_decision_id := get_decision_id();
+                insert into admin.space_mngr_decision_log values(
+                            g_execution_id,
+                            sysdate,
+                            v_decision_id,
+                            p_decision_name,
+                            0, -- decision_status, ignored
+                            p_decision_details);
+                commit;
+                if p_decision_name = 'exec_file_cmds' then
+                    sys.dbms_system.ksdwrt( 2, to_char(sysdate,'YYYY-MM-DD HH24:MI:SS')
+                                               ||' AutoSpaceManager'
+                                               ||' '||p_decision_name
+                                               ||' '||p_decision_details
+                    );
+                end if;
+            end if;
+        end if;
+    exception
+        when others then
+            dbms_output.put_line( 'Error encountered: ' || sqlerrm );
+    end;
+
+    -- ************************************************************************************************
+    -- TABLESPACE INFORMATION
+    -- ************************************************************************************************
+
+    procedure collect_tablespace_information
+    is
+    begin
+        g_tablespace_info.delete;
+        for r in (select * from admin.space_mngr_tablespace_info) loop
+            g_tablespace_info(r.tablespace_name) := r;
+        end loop;
+    end;
+
+    -- ************************************************************************************************
+    -- GENERAL INFORMATION
+    -- ************************************************************************************************
+
+    function megs_added_to_tablespace_today( p_tablespace_name varchar2 )
+        return number
+    is
+        v_added_today number;
+    begin
+        -- Technically not "today" but over the last 24 hours.
+        select round(nvl(sum(bytes),0)/1024/1024) as mbytes into v_added_today
+          from v$tablespace ts,
+               v$datafile   df
+         where ts.ts# = df.ts#
+           and (p_tablespace_name is null or ts.name = upper(p_tablespace_name))
+           and df.creation_time > sysdate - 1;
+        return v_added_today;
+    end;
+
+    function megs_added_to_database_today
+        return number
+    is
+    begin
+        return megs_added_to_tablespace_today( null );
+    end;
+
+    function tablespace_size( p_tablespace_name varchar2 )
+        return number
+    is
+        v_size number;
+    begin
+        select round(sum(bytes)/1024/1024) into v_size from dba_data_files where tablespace_name = upper(p_tablespace_name);
+        return v_size;
+    end;
+
+    function tablespace_max_size( p_tablespace_name varchar2 )
+        return number
+    is
+        v_max_size number;
+    begin
+        retrieve_configuration_value( 'p_tablespace_max_size', v_max_size, null, null, p_tablespace_name );
+        if v_max_size is null then
+            if p_tablespace_name = 'SYSAUX' then
+                v_max_size := 40*1024; -- 40GB
+            elsif p_tablespace_name = 'SYSTEM' then
+                v_max_size := 10*1024; -- 10GB
+            end if;
+        end if;
+        return v_max_size;
+    end;
+
+    function at_max_datafiles
+        return boolean
+    is
+        v_datafile_count    number;
+        v_dbfile_value      number;
+        v_test_dbfile_value number;
+    begin
+        select count(*) into v_datafile_count from dba_data_files;
+        select to_number(value) into v_dbfile_value from v$parameter where name = 'db_files';
+        retrieve_configuration_value( 'p_test_db_files', v_test_dbfile_value, null, null, null );
+        if v_test_dbfile_value is not null then
+            v_dbfile_value := v_test_dbfile_value;
+        end if;
+        return v_datafile_count >= v_dbfile_value;
+    end;
+
+    -- ************************************************************************************************
+    -- MOUNT POINT MANIPULATION
+    -- ************************************************************************************************
+
+    function select_target_filesystem( p_fs_pct_full_ignore in  integer,
+                                       p_tablespace_name    in  varchar2,
+                                       p_space_required     in  integer )
+        return varchar2
+    is
+        v_fs_to_use  varchar2(12);
+        v_tbs_max    number;
+        v_fs_max     number;
+    begin
+        v_fs_to_use  := null;
+        -- FIXME: Allow for max allocation of -1 to indicate maximum space available?
+        for r in (select filesystem,
+                         max_allocation_megs - used_space_megs as available_space_megs,
+                         used_pct
+                    from admin.space_mngr_filesystem_usage
+                   where max_allocation_megs - used_space_megs > 0
+                   order by max_allocation_megs - used_space_megs desc, filesystem asc
+                 ) loop
+            log_decision( 'select_filesystem', 'Checking target filesystem ' || r.filesystem );
+            v_fs_max := p_fs_pct_full_ignore;
+            retrieve_configuration_value( 'p_fs_pct_full_ignore', v_fs_max, 95, r.filesystem, null );
+            if r.used_pct >= v_fs_max then
+                log_decision( 'select_filesystem', 'Insufficient free space (' || r.used_pct || ' >= ' || v_fs_max || ') on ' || r.filesystem );
+                continue;
+            end if;
+            if r.available_space_megs < p_space_required then
+                log_decision( 'select_filesystem', 'Insufficient free space ( ' || r.available_space_megs || ' < ' || p_space_required || ')' );
+                continue;
+            end if;
+            v_fs_to_use := r.filesystem;
+            exit when v_fs_to_use is not null;
+        end loop;
+        if v_fs_to_use is null then
+            raise_application_error( excp_en_no_filesystem, 'No filesystem found with sufficient free space.' );
+        end if;
+        log_decision( 'select_filesystem', 'Selected filesystem is ' || v_fs_to_use );
+        return v_fs_to_use;
+    end;
+
+    function filesystem_space_available( p_filesystem_name varchar2 )
+        return number
+    is
+        v_available_space number;
+    begin
+        v_available_space := 0;
+        select max_allocation_megs - used_space_megs into v_available_space
+          from admin.space_mngr_filesystem_usage
+         where filesystem = p_filesystem_name;
+        -- FIXME: Catch not found exception.
+        return v_available_space;
+    end;
+
+    -- ************************************************************************************************
+    -- EXECUTION PROCEDURES
+    -- ************************************************************************************************
+
+    function generate_file_name( p_filesystem varchar2, p_tablespace varchar2 )
+        return varchar2
+    is
+        v_file_path varchar2(512);
+        v_file_name varchar2(128);
+        v_file_seq  number;
+    begin
+        -- /fs-a01-a/databases/tseal1na/pps-AA-01.dbf
+        v_file_seq := get_next_file_id( p_tablespace );
+        v_file_path   := p_filesystem || '/databases/' || g_db_name;
+        v_file_name   := lower(p_tablespace) || '-AA-' || v_file_seq || '.dbf';
+        -- Ensure filename is not in use.
+        if is_tablespace_filename_used( p_tablespace, v_file_name ) then
+            raise_application_error( excp_en_bad_filename, 'Filename ' || v_file_name || ' is already in use by tablespace ' || p_tablespace );
+        end if;
+        return v_file_path || '/' || v_file_name;
+    end;
+
+    procedure assert_condition( p_condition boolean, p_message varchar2, p_exception_id number default excp_en_assertion )
+    is
+    begin
+        if not p_condition then
+            raise_application_error( p_exception_id, p_message );
+        end if;
+    end;
+
+    function is_space_required( p_tablespace_name varchar2 )
+        return boolean
+    is
+        v_min_extents               integer;
+        v_min_space                 integer;
+        v_min_days_left             integer;
+        v_result                    boolean;
+    begin
+        v_min_extents              := g_min_extents;
+        v_min_space                := g_min_space;
+        v_min_days_left            := g_min_days_left;
+        retrieve_configuration_value( 'p_min_extents',              v_min_extents,                100, null, p_tablespace_name );
+        retrieve_configuration_value( 'p_min_space',                v_min_space,                  500, null, p_tablespace_name );
+        retrieve_configuration_value( 'p_min_days_left',            v_min_days_left,               10, null, p_tablespace_name );
+        v_result := false;
+        if      g_tablespace_info(p_tablespace_name).free_extents < v_min_extents   then
+            log_decision( 'is_space_required', 'Tablespace ' || p_tablespace_name || ' is below the minimum free extents ( ' ||
+                          g_tablespace_info(p_tablespace_name).free_extents || '/' || v_min_extents || ').' );
+            v_result := true;
+        elsif g_tablespace_info(p_tablespace_name).free_mbytes  < v_min_space     then
+            log_decision( 'is_space_required', 'Tablespace ' || p_tablespace_name || ' is below the minimum free space ( ' ||
+                          g_tablespace_info(p_tablespace_name).free_mbytes || '/' || v_min_space || ').' );
+            v_result := true;
+        elsif g_tablespace_info(p_tablespace_name).days_left    < v_min_days_left then
+            log_decision( 'is_space_required', 'Tablespace ' || p_tablespace_name || ' is below the minimum free days left ( ' ||
+                          g_tablespace_info(p_tablespace_name).days_left || '/' || v_min_days_left || ').' );
+            v_result := true;
+        end if;
+        return v_result;
+    end;
+
+    function get_datafile_filesystem( p_file_name varchar2 )
+        return varchar2
+    is
+        v_filesystem varchar2(1024);
+        v_fs_count   number;
+    begin
+        v_filesystem := regexp_replace( p_file_name, '^(.[^/]+)/.*', '\1' );
+        select count(*) into v_fs_count from admin.space_mngr_filesystem_info where filesystem = v_filesystem;
+        if v_fs_count > 0 then
+            return v_filesystem;
+        else
+            raise_application_error( excp_en_no_filesystem, 'Filename ' || p_file_name || ' does not result in a valid filesystem.' );
+        end if;
+    end;
+
+    procedure assert_space_is_available( p_filesystem varchar2, p_space_added_m number )
+    is
+        v_count number;
+    begin
+        -- Theoretically the filesystem selection process should have found a filesystem
+        -- with sufficient free space, but this is a failsafe mechanism.
+        select count(*) into v_count
+          from admin.space_mngr_filesystem_info
+         where filesystem = p_filesystem
+           and available_space_megs > p_space_added_m;
+        if v_count < 1 then
+            raise_application_error( excp_en_assertion, 'Filesystem ' || p_filesystem || ' has insuffient space available.' );
+        end if;
+    end;
+
+    procedure resize_datafile( p_tablespace_name in  varchar2,
+                               p_file_size_m     in  integer,
+                               p_amount_added    out number,
+                               p_file_resized    out boolean
+                               )
+    is
+        v_file_name      varchar2(1024);
+        v_file_size_m    number;
+        v_resize_command varchar2(1024);
+    begin
+        p_file_resized := false;
+        p_amount_added := 0;
+        v_file_name   := null;
+        v_file_size_m := null;
+        -- grow_tablespace has run, has proven we have room to add space, and need to add space.
+        -- We need to find out if there are any datafiles below the requested file size.
+        begin
+            select file_name, mbytes into v_file_name, v_file_size_m
+              from (
+            select file_name, trunc(bytes/1024/1024) as mbytes
+              from dba_data_files
+             where tablespace_name = upper(p_tablespace_name)
+               and trunc(bytes/1024/1024) < p_file_size_m
+             order by 2 desc
+            )
+            where rownum < 2;
+        exception when no_data_found then
+            log_decision( 'grow_tablespace', 'No files elligible for resizing.' );
+            return;
+        end;
+        -- If we got this far we have an elligible file.
+        log_decision( 'grow_tablespace', 'Resizing file ' || v_file_name || ' from ' || v_file_size_m || ' to ' || p_file_size_m || '.' );
+        v_resize_command := 'alter database datafile ''' || v_file_name || ''' resize ' || p_file_size_m || 'm';
+        begin
+            assert_space_is_available( get_datafile_filesystem(v_file_name), p_file_size_m - v_file_size_m );
+            log_decision( 'exec_file_cmds', 'Executing the following command : ' || v_resize_command );
+            p_amount_added := p_amount_added + (p_file_size_m-v_file_size_m);
+            if not g_do_nothing then
+                execute immediate(v_resize_command);
+            else
+                log_decision( 'exec_file_cmds', 'Execution skipped due to do_nothing flag.' );
+            end if;
+            p_file_resized := true;
+        exception
+            when others then
+                -- FIXME: Should we decrease the size of p_amount_added?
+                log_decision( 'exec_file_cmds', 'Execution failed: ' || sqlerrm );
+        end;
+
+    end;
+
+    procedure add_datafile( p_tablespace_name in  varchar2,
+                            p_file_size_m     in  integer,
+                            p_amount_added    out number
+                            )
+    is
+        v_fs_to_use                 varchar2(128);
+        v_filename                  varchar2(128);
+        v_add_command               varchar2(1000);
+    begin
+        p_amount_added := 0;
+        v_fs_to_use   := select_target_filesystem( g_fs_pct_full_ignore, p_tablespace_name, p_file_size_m );
+        log_decision( 'grow_tablespace', 'Selected filesystem is ' || v_fs_to_use );
+        -- We assume a filesystem was found; if not, an exception should have been thrown.
+        v_filename    := generate_file_name( v_fs_to_use, p_tablespace_name );
+        log_decision( 'is_space_required', 'Adding file ' || v_filename );
+        v_add_command := 'alter tablespace ' || p_tablespace_name
+                      || ' add datafile ''' || generate_file_name(v_fs_to_use,p_tablespace_name)
+                      || ''' size ' || p_file_size_m || 'm';
+        begin
+            assert_space_is_available( v_fs_to_use, p_file_size_m );
+            log_decision( 'exec_file_cmds', 'Executing the following command : ' || v_add_command );
+            p_amount_added := p_amount_added + p_file_size_m;
+            if not g_do_nothing then
+                execute immediate(v_add_command);
+            else
+                log_decision( 'exec_file_cmds', 'Execution skipped due to do_nothing flag.' );
+            end if;
+        exception
+            when others then
+                log_decision( 'exec_file_cmds', 'Execution failed: ' || sqlerrm );
+        end;
+    exception
+        when excp_no_filesystem then
+            log_decision( 'grow_tablespace', 'No filesystem found with sufficient free space.' );
+            p_amount_added := 0;
+    end;
+
+    procedure grow_tablespace( p_tablespace_name in  varchar2,
+                               p_amount_added    out number
+                               )
+    is
+        v_new_file_size             integer;
+        v_fs_pct_full_ignore        integer;
+        v_max_gigs_per_tbl_per_day  integer;
+        v_file_size_m               integer;
+        v_prefer_resize             boolean;
+        v_file_resized              boolean;
+    begin
+        v_max_gigs_per_tbl_per_day := g_max_gigs_per_tbl_per_day;
+        retrieve_configuration_value( 'p_max_gigs_per_tbl_per_day', v_max_gigs_per_tbl_per_day,    64, null, p_tablespace_name );
+        p_amount_added  := 0;
+        v_new_file_size := g_tablespace_info(p_tablespace_name).next_file_size_mb;
+        log_decision( 'grow_tablespace', 'Processing Tablespace Name : ' || p_tablespace_name || '   FileSize : ' || v_new_file_size );
+        if not is_space_required(p_tablespace_name) then
+            log_decision( 'grow_tablespace', 'Tablespace ' || p_tablespace_name || ' does not require space.' );
+             p_amount_added := 0;
+             return;
+        end if;
+        assert_condition( megs_added_to_tablespace_today(p_tablespace_name) < (v_max_gigs_per_tbl_per_day*1024),
+                          'Tablespace ' || p_tablespace_name || ' is already beyond the daily datafile limit of ' || v_max_gigs_per_tbl_per_day || ' GB.' );
+        assert_condition( tablespace_size(p_tablespace_name) < tablespace_max_size(p_tablespace_name),
+                          'Tablespace ' || p_tablespace_name || ' currently above maximum size. Space will not be added.' );
+        v_prefer_resize := null;
+        v_file_resized  := false;
+        retrieve_configuration_value( 'p_prefer_resize', v_prefer_resize, null, null, p_tablespace_name );
+        if v_prefer_resize then
+            log_decision( 'grow_tablespace', 'p_prefer_resize specified, attempting to resize a datafile.' );
+            resize_datafile( p_tablespace_name, v_new_file_size, p_amount_added, v_file_resized );
+            if p_amount_added > 0 then
+                return;
+            end if;
+        end if;
+        if not v_file_resized then
+            -- We did not resize, therefore we need to add.
+            -- Unless we are at max datafiles.
+            assert_condition( not at_max_datafiles(),
+                              'We are at db_files limit, please increase this system parameter.' );
+            add_datafile( p_tablespace_name, v_new_file_size, p_amount_added );
+        end if;
+    end;
+
+    procedure execute_space_mngr( p_tablespaces in varchar2 )
+    is
+        v_tablespace_name    varchar2(30);
+        v_tablespace_rx      varchar2(128);
+        v_amount_added       number;
+        v_total_amount_added number;
+        v_tablespace_count   number;
+    begin
+        collect_tablespace_information();
+        if p_tablespaces is not null then
+            v_tablespace_rx := regexp_replace(upper(p_tablespaces),'\s+','');
+            v_tablespace_rx := regexp_replace(v_tablespace_rx,',','|');
+            v_tablespace_rx := '^(' || v_tablespace_rx || ')$';
+        else
+            v_tablespace_rx := '.*';
+        end if;
+        log_decision( 'execute_space_manager', 'Tablespace pattern: ' || v_tablespace_rx );
+        v_tablespace_name    := g_tablespace_info.first;
+        v_total_amount_added := 0;
+        v_tablespace_count   := 0;
+        while v_tablespace_name is not null loop
+            if regexp_like(v_tablespace_name,v_tablespace_rx,'i') then
+                log_decision( 'execute_space_manager', 'Processing tablespace ' || v_tablespace_name );
+                v_amount_added := 0;
+                grow_tablespace( upper(v_tablespace_name), v_amount_added );
+                if v_amount_added > 0 then
+                    log_decision( 'is_space_required', 'Added ' || v_amount_added || ' to tablespace ' || v_tablespace_name );
+                    v_total_amount_added := v_total_amount_added + v_amount_added;
+                    v_tablespace_count := v_tablespace_count + 1;
+                end if;
+            end if;
+            v_tablespace_name := g_tablespace_info.next( v_tablespace_name );
+        end loop;
+        log_decision( 'is_space_required', 'Added ' || v_total_amount_added || ' across ' || v_tablespace_count || ' tablespaces.' );
+    end;
+
+    -- Pull a configuration value from the configuration table.
+    function get_configuration_value( p_cfg_name        in          varchar2,
+                                      p_fs_prefix       in          varchar2 default null,
+                                      p_tablespace_name in          varchar2 default null )
+        return varchar2
+    is
+        v_value admin.space_mngr_configuration.parameter_value%type;
+    begin
+        v_value := null;
+        if p_fs_prefix is not null and p_tablespace_name is not null then
+            raise_application_error( excp_en_bad_parameter, 'You may specify a filesystem prefix or tablespace, but not both.' );
+        end if;
+        begin
+              select parameter_value into v_value
+                from admin.space_mngr_configuration
+               where parameter_name                 = lower(p_cfg_name)
+                 and regexp_like(nvl(p_fs_prefix,'NONE'),nvl(filesystem_prefix,'NONE'))
+                 and (nvl(p_tablespace_name,'NONE') = nvl(tablespace_name,'NONE'))
+                 and rownum < 2;
+        exception when no_data_found then
+            v_value := null;
+            if p_tablespace_name is not null or p_fs_prefix is not null then
+                -- Try a global parameter.
+                v_value := get_configuration_value( p_cfg_name, null, null );
+            end if;
+        end;
+        return v_value;
+    end;
+
+
+    -- Determine a configuration value based on whether an override value
+    -- was supplied, a default value is given, and an associated value
+    -- exists in the configuration table. This procedure is overloaded
+    -- for various datatypes (explaining why it is a procedure rather than
+    -- a function).
+    procedure retrieve_configuration_value( p_cfg_name        in     varchar2,
+                                            p_cfg_value       in out integer,
+                                            p_cfg_default     in     integer,
+                                            p_fs_prefix       in     varchar2 default null,
+                                            p_tablespace_name in     varchar2 default null)
+    is
+        v_temp_value varchar2(30);
+        v_source     varchar2(30);
+    begin
+        if p_cfg_value is not null then
+            v_source := 'Supplied';
+        else
+            v_temp_value := get_configuration_value( p_cfg_name, p_fs_prefix, p_tablespace_name );
+            if v_temp_value is not null then
+                p_cfg_value := to_number(v_temp_value);
+                v_source    := 'Configuration';
+            else
+                p_cfg_value := p_cfg_default;
+                v_source    := 'Default';
+            end if;
+        end if;
+        log_decision( 'configuration', p_cfg_name||'|'||nvl(p_fs_prefix,'NULL')||'|'||nvl(p_tablespace_name,'NULL')
+                      || ': ' || p_cfg_value || ' (' || v_source || ').' );
+    end;
+
+    procedure retrieve_configuration_value( p_cfg_name        in     varchar2,
+                                            p_cfg_value       in out boolean,
+                                            p_cfg_default     in     boolean,
+                                            p_fs_prefix       in     varchar2 default null,
+                                            p_tablespace_name in     varchar2 default null)
+    is
+        v_temp_value    varchar2(30);
+        v_source        varchar2(30);
+        v_display_value varchar2(30);
+    begin
+        if p_cfg_value is not null then
+            v_source := 'Supplied';
+            if p_cfg_value then
+                v_display_value := 'true';
+            else
+                v_display_value := 'false';
+            end if;
+        else
+            v_temp_value := get_configuration_value( p_cfg_name, p_fs_prefix, p_tablespace_name );
+            if v_temp_value is not null then
+                if upper(v_temp_value) = 'YES' or upper(v_temp_value) = 'TRUE' then
+                    p_cfg_value     := true;
+                    v_display_value := 'true';
+                else
+                    p_cfg_value     := false;
+                    v_display_value := 'false';
+                end if;
+                v_source    := 'Configuration';
+            else
+                p_cfg_value := p_cfg_default;
+                v_source    := 'Default';
+            end if;
+        end if;
+        log_decision( 'configuration', p_cfg_name||'|'||nvl(p_fs_prefix,'NULL')||'|'||nvl(p_tablespace_name,'NULL')
+                      || ': ' || v_display_value || ' (' || v_source || ').' );
+    end;
+
+    procedure retrieve_configuration_value( p_cfg_name        in     varchar2,
+                                            p_cfg_value       in out varchar2,
+                                            p_cfg_default     in     varchar2,
+                                            p_fs_prefix       in     varchar2 default null,
+                                            p_tablespace_name in     varchar2 default null)
+    is
+        v_temp_value varchar2(30);
+        v_source     varchar2(30);
+    begin
+        if p_cfg_value is not null then
+            v_source        := 'Supplied';
+        else
+            v_temp_value := get_configuration_value( p_cfg_name, p_fs_prefix, p_tablespace_name );
+            if v_temp_value is not null then
+                p_cfg_value := v_temp_value;
+                v_source    := 'Configuration';
+            else
+                p_cfg_value := p_cfg_default;
+                v_source    := 'Default';
+            end if;
+        end if;
+        log_decision( 'configuration', p_cfg_name||'|'||nvl(p_fs_prefix,'NULL')||'|'||nvl(p_tablespace_name,'NULL')
+                      || ': ' || p_cfg_value || ' (' || v_source || ').' );
+    end;
+
+    -- ************************************************************************************************
+    -- PUBLIC PROCEDURES
+    -- ************************************************************************************************
+
+    procedure enable_tool
+    is
+        v_num_rows number;
+    begin
+        drop_parameter( 'DISABLED', null, null );
+    end;
+
+    procedure disable_tool
+    is
+    begin
+        set_parameter( 'DISABLED', 'TRUE', null, null );
+    end;
+
+    procedure set_parameter( p_parameter_name   varchar2,
+                             p_parameter_value  varchar2,
+                             p_tablespace_name  varchar2 default null,
+                             p_fs_prefix        varchar2 default null )
+    is
+        v_count number;
+    begin
+          select count(*) into v_count
+            from admin.space_mngr_configuration
+           where parameter_name                = lower(p_parameter_name)
+             and nvl(tablespace_name,'NONE')   = upper(nvl(p_tablespace_name,'NONE'))
+             and nvl(filesystem_prefix,'NONE') = upper(nvl(p_fs_prefix,'NONE'));
+        if v_count = 0 then
+              insert into admin.space_mngr_configuration
+                          ( parameter_name,
+                            parameter_value,
+                            tablespace_name,
+                            filesystem_prefix )
+              values ( lower(p_parameter_name),
+                       p_parameter_value,
+                       upper(p_tablespace_name),
+                       lower(p_fs_prefix) );
+        else
+              update admin.space_mngr_configuration
+                 set parameter_value = lower(p_parameter_value)
+               where parameter_name                = lower(p_parameter_name)
+                 and nvl(tablespace_name,'NONE')   = upper(nvl(p_tablespace_name,'NONE'))
+                 and nvl(filesystem_prefix,'NONE') = upper(nvl(p_fs_prefix,'NONE'));
+        end if;
+        commit;
+    end;
+
+    procedure drop_parameter( p_parameter_name  varchar2,
+                              p_tablespace_name varchar2 default null,
+                              p_fs_prefix       varchar2 default null )
+    is
+    begin
+          delete from admin.space_mngr_configuration
+           where parameter_name                = lower(p_parameter_name)
+             and nvl(tablespace_name,'NONE')   = upper(nvl(p_tablespace_name,'NONE'))
+             and nvl(filesystem_prefix,'NONE') = upper(nvl(p_fs_prefix,'NONE'));
+        commit;
+    end;
+
+    procedure import_filesystem_information
+    is
+    begin
+        log_decision( 'import_filesystem_information', 'Calling sys.space_mngr_import_fs_info' );
+        sys.space_mngr_import_fs_info;
+        log_decision( 'import_filesystem_information', 'Call complete' );
+    end;
+
+    procedure run_space_mngr( p_min_extents              in integer,
+                              p_min_space                in integer,
+                              p_min_days_left            in integer,
+                              p_fs_pct_full_ignore       in integer,
+                              p_max_gigs_per_tbl_per_day in integer,
+                              p_max_gigs_per_db_per_day  in integer,
+                              p_tablespaces              in varchar2,
+                              p_donothing                in boolean,
+                              p_debug                    in boolean,
+                              p_import_fs_info           in boolean
+                              )
+    is
+        v_tablespaces              varchar2(1024);
+        v_import_fs_info           boolean;
+    begin
+        dbms_application_info.set_module( 'AutoSpaceManager', 'Executing' );
+        g_debug           := p_debug;
+        g_do_nothing      := p_donothing;
+        g_execution_id    := get_execution_id;
+        g_decision_id_seq := 1;
+        assert_condition( is_open_primary(),      'Not a primary database or not open read write. Exiting.' );
+        assert_condition( is_sole_execution(),    'More than one session is running AutoSpaceManager' );
+        assert_condition( not is_tool_disabled(), 'Space Manager has been disabled.' );
+        g_min_extents              := p_min_extents;
+        g_min_space                := p_min_space;
+        g_min_days_left            := p_min_days_left;
+        g_fs_pct_full_ignore       := p_fs_pct_full_ignore;
+        g_max_gigs_per_tbl_per_day := p_max_gigs_per_tbl_per_day;
+        g_max_gigs_per_db_per_day  := p_max_gigs_per_db_per_day;
+        v_tablespaces              := p_tablespaces;
+        v_import_fs_info           := p_import_fs_info;
+        retrieve_configuration_value( 'p_tablespaces',              v_tablespaces,               null );
+        retrieve_configuration_value( 'p_max_gigs_per_db_per_day',  g_max_gigs_per_db_per_day,   64 );
+        retrieve_configuration_value( 'p_import_fs_info',           v_import_fs_info,            false );
+        select lower(name) into g_db_name from v$database;
+        log_decision( 'run_space_mngr', 'Starting new execution.' );
+        log_decision( 'configuration', 'Maximum GB per DB per day = ' || g_max_gigs_per_db_per_day );
+        if v_import_fs_info then
+            log_decision( 'configuration', 'Importing filesystem information.' );
+            import_filesystem_information;
+        else
+            log_decision( 'configuration', 'Not importing filesystem information.' );
+        end if;
+        assert_condition( is_fs_info_recent,    'File System information is not recent.' );
+        assert_condition( megs_added_to_database_today < (g_max_gigs_per_db_per_day*1024),
+                          'Database is beyond the daily datafile limit of ' || g_max_gigs_per_db_per_day || 'GB.' );
+        execute_space_mngr( v_tablespaces );
+        dbms_application_info.set_module( null, null );
+        log_decision( 'run_space_mngr', 'Ending Execution (SUCCESS)' );
+    exception
+        when excp_assertion then
+            log_decision( 'assertion_failed', sqlerrm );
+            dbms_application_info.set_module( null, null );
+            log_decision( 'run_space_mngr', 'Ending Execution (FAIL)' );
+        when others then
+            log_decision( 'run_space_mngr', 'Exception caught: ' || sqlerrm );
+            dbms_application_info.set_module( null, null );
+            log_decision( 'run_space_mngr', 'Ending Execution (FAIL)' );
+    end;
+
+end;
+/
+
+show errors
+
